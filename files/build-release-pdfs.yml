@@ -1,0 +1,227 @@
+name: Build and release PDFs
+
+# Every push to main renders the PDFs, cuts a semver release, and (once the
+# repo is configured) pushes the files to itch.io via butler.
+# Instantiate with bin/render.py --config <project.json>.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of the version to bump"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pdf-release-main
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Render PDFs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install PDF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libpango-1.0-0 \
+            libpangoft2-1.0-0
+          python -m pip install --upgrade pip
+          python -m pip install weasyprint pypdf
+
+      - name: Render reading PDF
+        run: |
+          test -f %%READING_SOURCE%%
+          mkdir -p dist
+          weasyprint %%READING_SOURCE%% %%READING_PDF%%
+
+      - name: Impose print-ready signatures
+        env:
+          INPUT_PDF: %%READING_PDF%%
+          OUTPUT_PDF: %%PRINT_PDF%%
+        run: |
+          python - <<'PY'
+          import os
+
+          from pypdf import PdfReader, PdfWriter, Transformation
+          from pypdf._page import PageObject
+
+          reader = PdfReader(os.environ["INPUT_PDF"])
+          source_pages = list(reader.pages)
+
+          if not source_pages:
+              raise SystemExit("The rendered PDF contains no pages")
+
+          # A booklet requires a page count divisible by four.
+          while len(source_pages) % 4:
+              source_pages.append(None)
+
+          page_count = len(source_pages)
+
+          # US Letter landscape, in points.
+          letter_width = 792
+          letter_height = 612
+          half_width = letter_width / 2
+
+          writer = PdfWriter()
+
+          def imposed_page(left, right):
+              sheet = PageObject.create_blank_page(
+                  width=letter_width,
+                  height=letter_height,
+              )
+
+              for source, x_position in (
+                  (left, 0),
+                  (right, half_width),
+              ):
+                  if source is None:
+                      continue
+
+                  source_width = float(source.mediabox.width)
+                  source_height = float(source.mediabox.height)
+
+                  scale = min(
+                      half_width / source_width,
+                      letter_height / source_height,
+                  )
+
+                  offset_x = (
+                      x_position
+                      + (half_width - source_width * scale) / 2
+                  )
+                  offset_y = (
+                      letter_height - source_height * scale
+                  ) / 2
+
+                  sheet.merge_transformed_page(
+                      source,
+                      Transformation()
+                      .scale(scale, scale)
+                      .translate(offset_x, offset_y),
+                  )
+
+              return sheet
+
+          # Standard booklet order, from the outside sheet toward the center.
+          for sheet_start in range(0, page_count // 4):
+              writer.add_page(
+                  imposed_page(
+                      source_pages[page_count - 1 - 2 * sheet_start],
+                      source_pages[2 * sheet_start],
+                  )
+              )
+
+              writer.add_page(
+                  imposed_page(
+                      source_pages[2 * sheet_start + 1],
+                      source_pages[page_count - 2 - 2 * sheet_start],
+                  )
+              )
+
+          with open(os.environ["OUTPUT_PDF"], "wb") as output:
+              writer.write(output)
+          PY
+%%EXTRA_RENDER_STEPS%%
+      - name: Check generated files
+        run: |
+          test -s %%READING_PDF%%
+          test -s %%PRINT_PDF%%
+%%EXTRA_CHECK_LINES%%
+          ls -lh dist/*.pdf
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: %%PROJECT%%-pdfs-${{ github.run_number }}
+          path: dist/*.pdf
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source (for tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download generated PDFs
+        uses: actions/download-artifact@v4
+        with:
+          name: %%PROJECT%%-pdfs-${{ github.run_number }}
+          path: dist
+
+      - name: Compute next semantic version
+        id: semver
+        env:
+          BUMP: ${{ github.event.inputs.bump || 'patch' }}
+        run: |
+          latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          if [ -z "$latest" ]; then
+            major=1; minor=0; patch=0
+          else
+            ver="${latest#v}"
+            IFS=. read -r major minor patch <<< "$ver"
+            case "$BUMP" in
+              major) major=$((major+1)); minor=0; patch=0 ;;
+              minor) minor=$((minor+1)); patch=0 ;;
+              *)     patch=$((patch+1)) ;;
+            esac
+          fi
+          echo "version=$major.$minor.$patch" >> "$GITHUB_OUTPUT"
+          echo "Next version: v$major.$minor.$patch (bump: $BUMP, previous: ${latest:-none})"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ steps.semver.outputs.version }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v${{ steps.semver.outputs.version }}" \
+            --generate-notes \
+            %%RELEASE_FILES%%
+
+      # Secrets are NOT allowed in `if:` conditions. Gate on the repo
+      # variable instead, and guard the secret in shell below.
+      - name: Install butler (itch.io uploader)
+        if: ${{ vars.ITCH_TARGET != '' }}
+        run: |
+          curl -L -o /tmp/butler.zip https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default
+          unzip -o -q /tmp/butler.zip -d /tmp/butler
+          chmod +x /tmp/butler/butler
+          /tmp/butler/butler -V
+
+      - name: Publish PDFs to itch.io
+        if: ${{ vars.ITCH_TARGET != '' }}
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+          ITCH_TARGET: ${{ vars.ITCH_TARGET }}
+          RELEASE_TAG: v${{ steps.semver.outputs.version }}
+        run: |
+          if [ -z "$BUTLER_API_KEY" ]; then
+            echo "BUTLER_API_KEY not configured; skipping itch.io publish."
+            exit 0
+          fi
+%%PUBLISH_BODY%%
